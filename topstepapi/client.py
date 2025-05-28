@@ -21,3 +21,4 @@ class TopstepClient:
         self.position = PositionAPI(self.token, self.base_url)
         self.trade = TradeAPI(self.token, self.base_url)
         self.history = HistoryAPI(self.token, self.base_url)
+        self.realtime = RealTimeClient(self.token)
