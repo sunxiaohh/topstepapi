@@ -1,4 +1,4 @@
-from sign```python
+
 from signalrcore.hub_connection_builder import HubConnectionBuilder
 from signalrcore.protocol.json_hub_protocol import JsonHubProtocol
 import logging
