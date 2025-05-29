@@ -87,6 +87,15 @@ client.order.cancel_order(account_id=123, order_id=456)
 
 # Modify an order
 client.order.modify_order(account_id=123, order_id=456, size=2, stop_price=1604)
+
+---here is some order status code:1: "New"
+2: "Working" 
+3: "Filled"
+4: "PartiallyFilled"
+5: "Cancelled"
+6: "Rejected"  ← Your order was rejected
+7: "Expired"
+8: "Modified"
 ```
 
 ---
