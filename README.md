@@ -96,6 +96,20 @@ client.order.modify_order(account_id=123, order_id=456, size=2, stop_price=1604)
 6: "Rejected"  ← Your order was rejected
 7: "Expired"
 8: "Modified"
+
+
+---order parameter referece:
+type	integer	The order type:
+1 = Limit
+2 = Market
+4 = Stop
+5 = TrailingStop
+6 = JoinBid
+7 = JoinAsk	Required	false
+side	integer	The side of the order:
+0 = Bid (buy)
+1 = Ask (sell)	Required	false
+
 ```
 
 ---
