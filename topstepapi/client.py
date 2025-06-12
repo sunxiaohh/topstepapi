@@ -9,7 +9,7 @@ from .realtime import RealTimeClient
 
 
 class TopstepClient:
-    def __init__(self, username: str, api_key: str, base_url: str = "https://api.topstepx.com"):
+    def __init__(self, username: str, api_key: str, base_url: str = "https://api.thefuturesdesk.projectx.com"):
         self.auth = AuthClient(base_url)
         self.auth.login(username, api_key)
         self.token = self.auth.get_token()
