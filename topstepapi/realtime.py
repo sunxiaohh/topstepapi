@@ -6,7 +6,7 @@ import logging
 class RealTimeClient:
     def __init__(self, token: str, hub: str = "user"):
         # Use WebSocket Secure (wss://) scheme instead of https://
-        base_url = "wss://rtc.topstepx.com/hubs/"
+        base_url = "wss://rtc.thefuturesdesk.projectx.com/hubs/"
         self.hub_url = f"{base_url}{hub}?access_token={token}"
         self.token = token
         
