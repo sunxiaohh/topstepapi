@@ -29,7 +29,7 @@ class MarketDataClient:
             .build()
         
         # Set up reconnection handler to re-subscribe
-        self.connection.on("reconnect", self._on_reconnected)
+        self.connection.on_reconnected(self._on_reconnected) 
         
         # Store subscription state for reconnection
         self._subscribed_quotes = set()  # Contract IDs subscribed to quotes
