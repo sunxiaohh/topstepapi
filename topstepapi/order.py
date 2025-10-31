@@ -60,7 +60,9 @@ class OrderAPI:
         stop_price=None,
         trail_price=None,
         custom_tag=None,
-        linked_order_id=None
+        linked_order_id=None,
+        stop_loss_bracket=None,
+        take_profit_bracket=None
     ):
         url = f"{self.base_url}/api/Order/place"
         headers = {
@@ -74,12 +76,23 @@ class OrderAPI:
             "type": type,
             "side": side,
             "size": size,
-            "limitPrice": limit_price,
-            "stopPrice": stop_price,
-            "trailPrice": trail_price,
-            "customTag": custom_tag,
-            "linkedOrderId": linked_order_id
         }
+
+        if limit_price is not None:
+            payload["limitPrice"] = limit_price
+        if stop_price is not None:
+            payload["stopPrice"] = stop_price
+        if trail_price is not None:
+            payload["trailPrice"] = trail_price
+        if custom_tag:
+            payload["customTag"] = custom_tag
+        if linked_order_id is not None:
+            payload["linkedOrderId"] = linked_order_id
+        if stop_loss_bracket:
+            payload["stopLossBracket"] = stop_loss_bracket
+        if take_profit_bracket:
+            payload["takeProfitBracket"] = take_profit_bracket
+
         response = requests.post(url, json=payload, headers=headers)
         if response.status_code == 200:
             data = response.json()
