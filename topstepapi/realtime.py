@@ -1,291 +1,336 @@
-from signalrcore.hub_connection_builder import HubConnectionBuilder
-from signalrcore.protocol.json_hub_protocol import JsonHubProtocol
-from signalrcore.transport.websockets.websocket_transport import WebsocketTransport
+from __future__ import annotations
+
 import logging
+import threading
+import time
+from typing import Callable, List, Optional, Sequence, Set, Tuple
+
+from signalrcore.hub_connection_builder import HubConnectionBuilder
+
 
 class RealTimeClient:
-    def __init__(self, token: str, hub: str = "user"):
-        # Use WebSocket Secure (wss://) scheme instead of https://
-        base_url = "wss://rtc.thefuturesdesk.projectx.com/hubs/"
-        self.hub_url = f"{base_url}{hub}?access_token={token}"
+    """SignalR client for Topstep user hub with robust reconnect logic."""
+
+    _DEFAULT_BACKOFF: Tuple[int, ...] = (2, 5, 10, 30)
+
+    def __init__(
+        self,
+        token: str,
+        hub: str = "user",
+        token_provider: Optional[Callable[[], str]] = None,
+        logger: Optional[logging.Logger] = None,
+        reconnect_backoff: Optional[Sequence[int]] = None,
+    ) -> None:
+        self.logger = logger or logging.getLogger("topstep.realtime")
+        self.logger.setLevel(self.logger.level or logging.INFO)
+        self._token_provider = token_provider
         self.token = token
-        
-        # Build connection with proper skip_negotiation configuration
-        self.connection = HubConnectionBuilder()\
-            .with_url(self.hub_url, options={
-                "verify_ssl": True,  # Use True for HTTPS URLs
-                "skip_negotiation": True,  # This should be True for direct WebSocket connections
-                "headers": {
-                    "Authorization": f"Bearer {self.token}"
-                }
-            })\
-            .configure_logging(logging.DEBUG, socket_trace=True)\
-            .with_automatic_reconnect({
-                "type": "raw",
-                "keep_alive_interval": 30,
-                "reconnect_interval": 10,
-                "max_reconnect_attempts": 10
-            })\
-            .build()
-        
-        # Set up reconnection handler to re-subscribe
-        self.connection.on("reconnect", self._on_reconnected)
-        
-        # Store subscription state for reconnection
+        # Follow ProjectX example: https://rtc.thefuturesdesk.projectx.com/hubs/user?access_token=TOKEN
+        self.base_url = "https://rtc.thefuturesdesk.projectx.com/hubs"
+        self.hub = hub
+        self.hub_url = ""
+
         self._subscribed_accounts = False
-        self._subscribed_orders_accounts = set()
-        self._subscribed_positions_accounts = set()
-        self._subscribed_trades_accounts = set()
+        self._subscribed_orders_accounts: Set[str] = set()
+        self._subscribed_positions_accounts: Set[str] = set()
+        self._subscribed_trades_accounts: Set[str] = set()
 
-    def _on_reconnected(self, connection_id):
-        """Handle reconnection by re-subscribing to all previous subscriptions"""
-        print(f"RTC Connection Reconnected with ID: {connection_id}")
-        
-        # Re-subscribe to all previous subscriptions
-        if self._subscribed_accounts:
-            print("Re-subscribing to accounts...")
-            try:
-                self.connection.send("SubscribeAccounts", [])
-            except Exception as e:
-                print(f"Error re-subscribing to accounts: {e}")
-        
-        for account_id in self._subscribed_orders_accounts:
-            print(f"Re-subscribing to orders for account {account_id}...")
-            try:
-                self.connection.send("SubscribeOrders", [account_id])
-            except Exception as e:
-                print(f"Error re-subscribing to orders: {e}")
-        
-        for account_id in self._subscribed_positions_accounts:
-            print(f"Re-subscribing to positions for account {account_id}...")
-            try:
-                self.connection.send("SubscribePositions", [account_id])
-            except Exception as e:
-                print(f"Error re-subscribing to positions: {e}")
-        
-        for account_id in self._subscribed_trades_accounts:
-            print(f"Re-subscribing to trades for account {account_id}...")
-            try:
-                self.connection.send("SubscribeTrades", [account_id])
-            except Exception as e:
-                print(f"Error re-subscribing to trades: {e}")
+        self._event_handler_specs: List[Tuple[str, Callable]] = []
+        self._disconnect_handlers: List[Callable[[], None]] = []
+        self._reconnect_handlers: List[Callable[[], None]] = []
 
-    def start(self):
-        """Start the real-time connection"""
-        try:
-            print(f"🔌 Connecting to: {self.hub_url}")
-            print("⚙️ Using WebSocket Secure (wss://) with skipNegotiation=True")
-            self.connection.start()
-            print("✅ Real-time connection started successfully")
+        self._connection_lock = threading.RLock()
+        self._is_connected = threading.Event()
+        self._stop_event = threading.Event()
+        self._reconnect_lock = threading.Lock()
+        self._reconnect_thread: Optional[threading.Thread] = None
+        self._reconnect_backoff: Tuple[int, ...] = (
+            tuple(reconnect_backoff) if reconnect_backoff else self._DEFAULT_BACKOFF
+        )
+
+        self.connection = None
+        self._build_connection()
+
+    # ------------------------------------------------------------------
+    # Connection lifecycle
+    # ------------------------------------------------------------------
+    def _build_connection(self) -> None:
+        token = self._token_provider() if self._token_provider else self.token
+        if not token:
+            raise ValueError("No API token available for realtime connection")
+        self.token = token
+        # Matching the example: https://rtc.thefuturesdesk.projectx.com/hubs/{hub}?access_token=TOKEN
+        self.hub_url = f"{self.base_url}/{self.hub}?access_token={token}"
+
+        builder = HubConnectionBuilder().with_url(
+            self.hub_url,
+            options={
+                "verify_ssl": True,
+                "skip_negotiation": True,  # per ProjectX example
+                "transport": "WebSockets",
+                "access_token_factory": lambda: token,
+            },
+        )
+        builder = builder.with_automatic_reconnect(
+            {
+                "type": "raw",
+                "keep_alive_interval": 15,
+                "reconnect_interval": 5,
+                "max_reconnect_attempts": 0,
+            }
+        )
+        connection = builder.build()
+        connection.on_open(self._on_open)
+        connection.on_close(self._on_close)
+        connection.on_error(self._on_error)
+
+        for event, handler in self._event_handler_specs:
+            connection.on(event, handler)
+
+        self.connection = connection
+
+    def start(self) -> bool:
+        self.logger.info("Starting realtime connection to %s", self.hub_url)
+        self._stop_event.clear()
+        with self._connection_lock:
+            if self.connection is None:
+                self._build_connection()
+            self._is_connected.clear()
+            try:
+                self.connection.start()
+            except Exception as exc:  # pragma: no cover - network dependent
+                self.logger.exception("Failed to start realtime connection: %s", exc)
+                self._schedule_reconnect(f"start_error:{exc}", immediate=True)
+                return False
+        if self._is_connected.wait(timeout=5):
+            self.logger.info("Realtime connection established")
             return True
-        except Exception as e:
-            print(f"❌ Failed to start real-time connection: {e}")
-            print(f"Error details: {str(e)}")
+        self.logger.warning("Realtime connection start pending; watchdog will monitor")
+        return False
+
+    def stop(self) -> None:
+        self.logger.info("Stopping realtime connection")
+        self._stop_event.set()
+        with self._connection_lock:
+            try:
+                if self.connection:
+                    self.connection.stop()
+            except Exception as exc:  # pragma: no cover - network dependent
+                self.logger.warning("Error stopping realtime connection: %s", exc)
+            finally:
+                self._is_connected.clear()
+        self._join_reconnect_thread()
+
+    def _on_open(self) -> None:
+        self.logger.info("Realtime connection opened")
+        self._is_connected.set()
+        with self._reconnect_lock:
+            self._reconnect_thread = None
+        self._resubscribe_all()
+        for handler in list(self._reconnect_handlers):
+            try:
+                handler()
+            except Exception as exc:  # pragma: no cover
+                self.logger.exception("Realtime reconnect handler raised: %s", exc)
+
+    def _on_close(self, args=None) -> None:
+        if self._stop_event.is_set():
+            self.logger.info("Realtime connection closed (stop requested)")
+        else:
+            self.logger.warning("Realtime connection closed: %s", args)
+        self._is_connected.clear()
+        for handler in list(self._disconnect_handlers):
+            try:
+                handler()
+            except Exception as exc:  # pragma: no cover
+                self.logger.exception("Realtime disconnect handler raised: %s", exc)
+        if not self._stop_event.is_set():
+            self._schedule_reconnect(f"close:{args}")
+
+    def _on_error(self, error) -> None:
+        self.logger.error("Realtime connection error: %s", error)
+        if not self._stop_event.is_set():
+            self._schedule_reconnect(f"error:{error}")
+
+    # ------------------------------------------------------------------
+    # Reconnect handling
+    # ------------------------------------------------------------------
+    def _schedule_reconnect(self, reason: str, immediate: bool = False) -> None:
+        if self._stop_event.is_set():
+            return
+        with self._reconnect_lock:
+            if self._reconnect_thread and self._reconnect_thread.is_alive():
+                return
+            self._reconnect_thread = threading.Thread(
+                target=self._reconnect_loop,
+                args=(reason, immediate),
+                daemon=True,
+            )
+            self._reconnect_thread.start()
+
+    def _reconnect_loop(self, reason: str, immediate: bool) -> None:
+        attempt = 0
+        backoff = (0,) + self._reconnect_backoff if immediate else self._reconnect_backoff
+        while not self._stop_event.is_set():
+            delay = backoff[min(attempt, len(backoff) - 1)]
+            if delay:
+                self.logger.info("Realtime reconnect attempt %s in %ss (%s)", attempt + 1, delay, reason)
+                time.sleep(delay)
+            else:
+                self.logger.info("Realtime reconnect attempt %s immediately (%s)", attempt + 1, reason)
+            attempt += 1
+            if self._stop_event.is_set():
+                break
+            try:
+                with self._connection_lock:
+                    self._is_connected.clear()
+                    try:
+                        if self.connection:
+                            self.connection.stop()
+                    except Exception:
+                        pass
+                    self._build_connection()
+                    self.connection.start()
+                if self._is_connected.wait(timeout=5):
+                    self.logger.info("Realtime reconnect succeeded")
+                    return
+                self.logger.warning("Realtime reconnect attempt timed out")
+            except Exception as exc:
+                self.logger.exception("Realtime reconnect failed: %s", exc)
+        self.logger.info("Realtime reconnect loop exiting (stop=%s)", self._stop_event.is_set())
+
+    def _join_reconnect_thread(self) -> None:
+        with self._reconnect_lock:
+            thread = self._reconnect_thread
+            self._reconnect_thread = None
+        if thread and thread.is_alive():
+            thread.join(timeout=1)
+
+    def force_reconnect(self, reason: str = "manual") -> None:
+        self.logger.warning("Force realtime reconnect requested (%s)", reason)
+        self._schedule_reconnect(reason, immediate=True)
+
+    # ------------------------------------------------------------------
+    # Subscription management
+    # ------------------------------------------------------------------
+    def _resubscribe_all(self) -> None:
+        if self._subscribed_accounts:
+            self._send("SubscribeAccounts", [])
+        for account_id in list(self._subscribed_orders_accounts):
+            self._send("SubscribeOrders", [account_id])
+        for account_id in list(self._subscribed_positions_accounts):
+            self._send("SubscribePositions", [account_id])
+        for account_id in list(self._subscribed_trades_accounts):
+            self._send("SubscribeTrades", [account_id])
+
+    def _send(self, method: str, args) -> bool:
+        try:
+            self.connection.send(method, args)
+            return True
+        except Exception as exc:
+            self.logger.exception("Realtime send failed (%s): %s", method, exc)
             return False
 
-    def stop(self):
-        """Stop the real-time connection"""
-        try:
-            # Unsubscribe from all before stopping
-            self.unsubscribe_all()
-            self.connection.stop()
-            print("✅ Real-time connection stopped")
-        except Exception as e:
-            print(f"⚠️ Error stopping connection: {e}")
-
-    def subscribe_accounts(self):
-        """Subscribe to account updates"""
-        try:
-            self.connection.send("SubscribeAccounts", [])
+    def subscribe_accounts(self) -> None:
+        if self._send("SubscribeAccounts", []):
             self._subscribed_accounts = True
-            print("✅ Subscribed to account updates")
-        except Exception as e:
-            print(f"❌ Failed to subscribe to accounts: {e}")
+            self.logger.info("Subscribed to account updates")
 
-    def subscribe_orders(self, account_id):
-        """Subscribe to order updates for specific account"""
-        try:
-            self.connection.send("SubscribeOrders", [account_id])
+    def subscribe_orders(self, account_id: str) -> None:
+        if self._send("SubscribeOrders", [account_id]):
             self._subscribed_orders_accounts.add(account_id)
-            print(f"✅ Subscribed to order updates for account {account_id}")
-        except Exception as e:
-            print(f"❌ Failed to subscribe to orders for account {account_id}: {e}")
+            self.logger.info("Subscribed to order updates for %s", account_id)
 
-    def subscribe_positions(self, account_id):
-        """Subscribe to position updates for specific account"""
-        try:
-            self.connection.send("SubscribePositions", [account_id])
+    def subscribe_positions(self, account_id: str) -> None:
+        if self._send("SubscribePositions", [account_id]):
             self._subscribed_positions_accounts.add(account_id)
-            print(f"✅ Subscribed to position updates for account {account_id}")
-        except Exception as e:
-            print(f"❌ Failed to subscribe to positions for account {account_id}: {e}")
+            self.logger.info("Subscribed to position updates for %s", account_id)
 
-    def subscribe_trades(self, account_id):
-        """Subscribe to trade updates for specific account"""
-        try:
-            self.connection.send("SubscribeTrades", [account_id])
+    def subscribe_trades(self, account_id: str) -> None:
+        if self._send("SubscribeTrades", [account_id]):
             self._subscribed_trades_accounts.add(account_id)
-            print(f"✅ Subscribed to trade updates for account {account_id}")
-        except Exception as e:
-            print(f"❌ Failed to subscribe to trades for account {account_id}: {e}")
+            self.logger.info("Subscribed to trade updates for %s", account_id)
 
-    def unsubscribe_accounts(self):
-        """Unsubscribe from account updates"""
-        try:
-            self.connection.send("UnsubscribeAccounts", [])
+    def unsubscribe_accounts(self) -> None:
+        if self._send("UnsubscribeAccounts", []):
             self._subscribed_accounts = False
-            print("✅ Unsubscribed from account updates")
-        except Exception as e:
-            print(f"❌ Failed to unsubscribe from accounts: {e}")
 
-    def unsubscribe_orders(self, account_id):
-        """Unsubscribe from order updates for specific account"""
-        try:
-            self.connection.send("UnsubscribeOrders", [account_id])
+    def unsubscribe_orders(self, account_id: str) -> None:
+        if self._send("UnsubscribeOrders", [account_id]):
             self._subscribed_orders_accounts.discard(account_id)
-            print(f"✅ Unsubscribed from order updates for account {account_id}")
-        except Exception as e:
-            print(f"❌ Failed to unsubscribe from orders for account {account_id}: {e}")
 
-    def unsubscribe_positions(self, account_id):
-        """Unsubscribe from position updates for specific account"""
-        try:
-            self.connection.send("UnsubscribePositions", [account_id])
+    def unsubscribe_positions(self, account_id: str) -> None:
+        if self._send("UnsubscribePositions", [account_id]):
             self._subscribed_positions_accounts.discard(account_id)
-            print(f"✅ Unsubscribed from position updates for account {account_id}")
-        except Exception as e:
-            print(f"❌ Failed to unsubscribe from positions for account {account_id}: {e}")
 
-    def unsubscribe_trades(self, account_id):
-        """Unsubscribe from trade updates for specific account"""
-        try:
-            self.connection.send("UnsubscribeTrades", [account_id])
+    def unsubscribe_trades(self, account_id: str) -> None:
+        if self._send("UnsubscribeTrades", [account_id]):
             self._subscribed_trades_accounts.discard(account_id)
-            print(f"✅ Unsubscribed from trade updates for account {account_id}")
-        except Exception as e:
-            print(f"❌ Failed to unsubscribe from trades for account {account_id}: {e}")
 
-    def unsubscribe_all(self):
-        """Unsubscribe from all updates"""
+    def unsubscribe_all(self) -> None:
         if self._subscribed_accounts:
             self.unsubscribe_accounts()
-        
-        # Unsubscribe from all account-specific subscriptions
         for account_id in list(self._subscribed_orders_accounts):
             self.unsubscribe_orders(account_id)
-        
         for account_id in list(self._subscribed_positions_accounts):
             self.unsubscribe_positions(account_id)
-        
         for account_id in list(self._subscribed_trades_accounts):
             self.unsubscribe_trades(account_id)
 
+    # ------------------------------------------------------------------
+    # Event registration
+    # ------------------------------------------------------------------
+    def _register_event(self, event: str, handler) -> None:
+        self._event_handler_specs.append((event, handler))
+        if self.connection:
+            self.connection.on(event, handler)
+
     def on_account_update(self, handler):
-        """Register handler for account updates - matches JS 'GatewayUserAccount'"""
-        try:
-            self.connection.on("GatewayUserAccount", handler)
-            print("✅ Account update handler registered")
-        except Exception as e:
-            print(f"❌ Failed to register account handler: {e}")
+        self._register_event("GatewayUserAccount", handler)
+        return self
 
     def on_order_update(self, handler):
-        """Register handler for order updates - matches JS 'GatewayUserOrder'"""
-        try:
-            self.connection.on("GatewayUserOrder", handler)
-            print("✅ Order update handler registered")
-        except Exception as e:
-            print(f"❌ Failed to register order handler: {e}")
+        self._register_event("GatewayUserOrder", handler)
+        return self
 
     def on_position_update(self, handler):
-        """Register handler for position updates - matches JS 'GatewayUserPosition'"""
-        try:
-            self.connection.on("GatewayUserPosition", handler)
-            print("✅ Position update handler registered")
-        except Exception as e:
-            print(f"❌ Failed to register position handler: {e}")
+        self._register_event("GatewayUserPosition", handler)
+        return self
 
     def on_trade_update(self, handler):
-        """Register handler for trade updates - matches JS 'GatewayUserTrade'"""
-        try:
-            self.connection.on("GatewayUserTrade", handler)
-            print("✅ Trade update handler registered")
-        except Exception as e:
-            print(f"❌ Failed to register trade handler: {e}")
+        self._register_event("GatewayUserTrade", handler)
+        return self
 
-    def is_connected(self):
-        """Check if connection is active"""
-        try:
-            # Check if connection exists and has transport
-            if not hasattr(self.connection, 'transport') or not hasattr(self.connection.transport, 'state'):
-                return False
-            
-            # Check the state value directly - it should be 1 for connected
-            state = self.connection.transport.state
-            
-            # ConnectionState.connected has value 1
-            # We can check either by value or by string representation
-            return (hasattr(state, 'value') and state.value == 1) or str(state).endswith('connected: 1>')
-        except Exception as e:
-            print(f"Error checking connection state: {e}")
-            return False
+    def on_disconnect(self, handler: Callable[[], None]):
+        self._disconnect_handlers.append(handler)
+        return self
 
-    def get_connection_state(self):
-        """Get current connection state for debugging"""
-        try:
-            state = "Unknown"
-            state_raw = None
-            is_connected = False
-            
-            if hasattr(self.connection, 'transport') and hasattr(self.connection.transport, 'state'):
-                state_raw = self.connection.transport.state
-                
-                # Try to determine state without importing enum
-                if hasattr(state_raw, 'value'):
-                    if state_raw.value == 1:
-                        state = "Connected"
-                        is_connected = True
-                    elif state_raw.value == 0:
-                        state = "Connecting"
-                    elif state_raw.value == 2:
-                        state = "Disconnected"
-                    else:
-                        state = f"Unknown({state_raw.value})"
-                else:
-                    # Fallback to string representation
-                    state_str = str(state_raw)
-                    if 'connected: 1' in state_str:
-                        state = "Connected"
-                        is_connected = True
-                    elif 'connecting: 0' in state_str:
-                        state = "Connecting"
-                    elif 'disconnected: 2' in state_str:
-                        state = "Disconnected"
-                    else:
-                        state = state_str
-            
-            return {
-                "state": state,
-                "state_raw": str(state_raw),
-                "is_connected": is_connected,
-                "url": self.hub_url,
-                "transport": "WebSocket Secure (wss://)",
-                "skip_negotiation": True,
-                "verify_ssl": True,
-                "subscriptions": {
-                    "accounts": self._subscribed_accounts,
-                    "orders_accounts": list(self._subscribed_orders_accounts),
-                    "positions_accounts": list(self._subscribed_positions_accounts),
-                    "trades_accounts": list(self._subscribed_trades_accounts)
-                }
-            }
-        except Exception as e:
-            return {"error": str(e), "raw_error": repr(e)}
+    def on_reconnect(self, handler: Callable[[], None]):
+        self._reconnect_handlers.append(handler)
+        return self
 
-    def get_subscribed_accounts(self):
-        """Get list of accounts currently subscribed to"""
-        return {
-            "accounts_general": self._subscribed_accounts,
-            "orders": list(self._subscribed_orders_accounts),
-            "positions": list(self._subscribed_positions_accounts),
-            "trades": list(self._subscribed_trades_accounts)
-        }
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def is_connected(self) -> bool:
+        return self._is_connected.is_set()
+
+    def wait_for_connection(self, timeout: float = 10.0) -> bool:
+        return self._is_connected.wait(timeout=timeout)
+
+    def get_connection_state(self) -> str:
+        if not self.connection:
+            return "Disconnected"
+        try:
+            transport = getattr(self.connection, "transport", None)
+            state = getattr(transport, "state", None)
+            value = getattr(state, "value", None)
+            if value == 0:
+                return "Connecting"
+            if value == 1:
+                return "Connected"
+            if value == 2:
+                return "Disconnected"
+            return f"Unknown({value})"
+        except Exception:  # pragma: no cover
+            return "Unknown"

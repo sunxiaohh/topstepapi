@@ -131,7 +131,9 @@ class OrderAPI:
         size=None,
         limit_price=None,
         stop_price=None,
-        trail_price=None
+        trail_price=None,
+        stop_loss_bracket=None,
+        take_profit_bracket=None,
     ):
         url = f"{self.base_url}/api/Order/modify"
         headers = {
@@ -142,11 +144,20 @@ class OrderAPI:
         payload = {
             "accountId": account_id,
             "orderId": order_id,
-            "size": size,
-            "limitPrice": limit_price,
-            "stopPrice": stop_price,
-            "trailPrice": trail_price
         }
+        if size is not None:
+            payload["size"] = size
+        if limit_price is not None:
+            payload["limitPrice"] = limit_price
+        if stop_price is not None:
+            payload["stopPrice"] = stop_price
+        if trail_price is not None:
+            payload["trailPrice"] = trail_price
+        if stop_loss_bracket:
+            payload["stopLossBracket"] = stop_loss_bracket
+        if take_profit_bracket:
+            payload["takeProfitBracket"] = take_profit_bracket
+
         response = requests.post(url, json=payload, headers=headers)
         if response.status_code == 200:
             data = response.json()
